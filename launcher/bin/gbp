@@ -233,6 +233,7 @@ Usage:
   gbp quit <profile>       quit only that profile's Grok Bot instance
   gbp badge <profile>      (re)start the window badge for a running profile
   gbp shortcut <profile>   create a double-clickable launcher .app (see --help)
+  gbp uninstall            remove gbp, its shortcuts and PATH line (asks first)
   gbp help [command]       show help for a command
 
 <profile> can be the folder name, the display name, or the number.
@@ -283,6 +284,25 @@ Default destination is ~/Desktop; --applications uses ~/Applications
 (drag it to the Dock from there); --dest picks any folder.
 --remove deletes that profile's shortcut(s) in the folder, matched by bundle id
 (io.gblauncher.profile.<name>, or the older io.gbghost.profile.<name>).
+EOF
+    ;;
+    uninstall) cat <<'EOF'
+gbp uninstall [--yes] [--delete-profiles] [--keep-path] [--keep-repo]
+
+Shows what it will remove, asks "Continue? [y/N]", then:
+  - quits every running extra profile (never default) and its badge
+  - removes GB Launcher shortcuts (bundle id io.gblauncher.profile.* or
+    io.gbghost.profile.*) in ~/Desktop, ~/Applications and /Applications
+  - removes ~/.local/bin/gbp if it's a symlink into this repo
+  - removes the exact line export PATH="$HOME/.local/bin:$PATH" from ~/.zshrc
+    (backup in ~/.zshrc.gbp-backup). Other tools in ~/.local/bin may need it.
+  - deletes this GB Launcher folder, last
+It asks separately before deleting your profiles and their sign-ins.
+  --yes               don't ask (profiles are KEPT unless --delete-profiles)
+  --delete-profiles   also delete every profile in ~/GrokBotProfiles (GBP_HOME)
+  --keep-path         leave ~/.zshrc alone
+  --keep-repo         leave the GB Launcher folder in place
+Never touches the Grok Bot app or your default Grok Bot data.
 EOF
     ;;
     *) usage ;;
@@ -643,6 +663,162 @@ cmd_shortcut() {
   make_shortcut "$slug" "$dest"
 }
 
+# ---------------------------------------------------------------------------
+# Uninstall
+# ---------------------------------------------------------------------------
+
+# The exact line the README's install block appends to ~/.zshrc.
+# shellcheck disable=SC2016  # literal text, not expanded
+GBP_PATH_LINE='export PATH="$HOME/.local/bin:$PATH"'
+
+# Folders searched for shortcut bundles (colon-separated; override for tests).
+shortcut_dirs() {
+  printf '%s\n' "${GBP_SHORTCUT_DIRS:-$HOME/Desktop:$HOME/Applications:/Applications}" | tr ':' '\n'
+}
+
+# Print every GB Launcher shortcut .app in the shortcut folders, matched only
+# by CFBundleIdentifier (current or legacy prefix). Other apps are never listed.
+find_shortcuts() {
+  local dir app id p
+  while IFS= read -r dir; do
+    [ -n "$dir" ] && [ -d "$dir" ] || continue
+    for app in "$dir"/*.app; do
+      [ -f "$app/Contents/Info.plist" ] || continue
+      id="$(plutil -extract CFBundleIdentifier raw -o - "$app/Contents/Info.plist" 2>/dev/null)" || continue
+      for p in $BUNDLE_PREFIX $LEGACY_BUNDLE_PREFIXES; do
+        case "$id" in "$p".?*) printf '%s\n' "$app"; break ;; esac
+      done
+    done
+  done < <(shortcut_dirs)
+}
+
+# The repo this script lives in, if it really looks like a gb-launcher clone.
+repo_dir() {
+  local r
+  r="$(cd -P "$GBP_BIN_DIR/../.." 2>/dev/null && pwd)" || return 1
+  [ -n "$r" ] && [ "$r" != / ] && [ "$r" != "$HOME" ] || return 1
+  [ -f "$r/launcher/bin/gbp" ] && [ -d "$r/.git" ] || return 1
+  printf '%s' "$r"
+}
+
+# ~/.local/bin/gbp, only if it is a symlink to this repo's gbp.
+our_symlink() {
+  local link="$HOME/.local/bin/gbp" target dir
+  [ -L "$link" ] || return 1
+  target="$(readlink "$link")"
+  case "$target" in /*) ;; *) target="$HOME/.local/bin/$target" ;; esac
+  [ "$(basename "$target")" = gbp ] || return 1
+  dir="$(cd -P "$(dirname "$target")" 2>/dev/null && pwd)" || return 1
+  [ "$dir" = "$GBP_BIN_DIR" ] || return 1
+  printf '%s' "$link"
+}
+
+ask_yes() { # prompt -> 0 for y/yes; default no; EOF counts as no
+  local answer
+  printf '%s [y/N]: ' "$1"
+  read -r answer || { echo; return 1; }
+  case "$answer" in y|Y|yes|Yes|YES) return 0 ;; esac
+  return 1
+}
+
+cmd_uninstall() {
+  local yes=false delete_profiles=false keep_path=false keep_repo=false a
+  local s pid running="" shortcuts link="" zshrc="$HOME/.zshrc" has_line=false repo="" slugs i bpid
+  for a in "$@"; do
+    case "$a" in
+      -y|--yes) yes=true ;;
+      --delete-profiles) delete_profiles=true ;;
+      --keep-path) keep_path=true ;;
+      --keep-repo) keep_repo=true ;;
+      -h|--help) help_for uninstall; return 0 ;;
+      *) die "unknown option for uninstall: $a (see: gbp help uninstall)" ;;
+    esac
+  done
+  slugs="$(list_slugs)"
+  for s in $slugs; do pid="$(pid_of_profile "$s")" && running="$running $s"; done
+  shortcuts="$(find_shortcuts)"
+  link="$(our_symlink)" || link=""
+  if ! $keep_path && [ -f "$zshrc" ] && grep -qxF "$GBP_PATH_LINE" "$zshrc"; then has_line=true; fi
+  if ! $keep_repo; then repo="$(repo_dir)" || repo=""; fi
+
+  echo "GB Launcher uninstall will:"
+  if [ -n "$running" ]; then
+    for s in $running; do echo "  - quit running profile '$s' and its badge"; done
+  else
+    echo "  - (no extra profiles are running)"
+  fi
+  if [ -n "$shortcuts" ]; then
+    while IFS= read -r a; do echo "  - remove shortcut $a"; done <<< "$shortcuts"
+  else
+    echo "  - (no GB Launcher shortcuts found)"
+  fi
+  if [ -n "$link" ]; then echo "  - remove $link"; else echo "  - (no gbp symlink to this repo in ~/.local/bin)"; fi
+  if $has_line; then
+    echo "  - remove the line $GBP_PATH_LINE from $zshrc"
+    echo "    (backup: $zshrc.gbp-backup; other tools in ~/.local/bin may rely on it; --keep-path skips this)"
+  elif $keep_path; then echo "  - keep your PATH line in $zshrc (--keep-path)"
+  fi
+  if [ -n "$repo" ]; then echo "  - delete the GB Launcher folder $repo (last)"
+  elif $keep_repo; then echo "  - keep the GB Launcher folder (--keep-repo)"
+  fi
+  if $delete_profiles; then echo "  - DELETE your profiles and their sign-ins in $GBP_HOME"
+  else echo "  - keep your profiles in $GBP_HOME (you'll be asked)"
+  fi
+  echo "It never touches $GBP_APP or your default Grok Bot data."
+  echo
+  if ! $yes; then ask_yes "Continue?" || { echo "Nothing removed."; return 0; }
+    if ! $delete_profiles && [ -n "$slugs" ]; then
+      ask_yes "Also delete your profiles and their sign-ins in $GBP_HOME?" && delete_profiles=true
+    fi
+  fi
+
+  # 1. Quit extra profiles (never default) and stop badge helpers.
+  for s in $running; do cmd_quit "$s"; done
+  for s in $slugs; do
+    bpid="$(badge_running "$s")" && kill "$bpid" 2>/dev/null && echo "Stopped badge for '$s'"
+  done
+  if [ -n "$running" ]; then
+    i=0
+    while [ $i -lt 20 ]; do
+      pid=""; for s in $running; do pid_of_profile "$s" >/dev/null && pid=y; done
+      [ -z "$pid" ] && break
+      sleep 0.5; i=$((i + 1))
+    done
+    [ -n "$pid" ] && echo "Note: some profiles are still quitting."
+  fi
+  # 2. Shortcuts.
+  if [ -n "$shortcuts" ]; then
+    while IFS= read -r a; do rm -rf "$a" && echo "Removed $a"; done <<< "$shortcuts"
+  fi
+  # 3. Symlink.
+  [ -n "$link" ] && rm -f "$link" && echo "Removed $link"
+  # 4. PATH line (backup first; rewrite in place so a symlinked ~/.zshrc stays a symlink).
+  if $has_line; then
+    if cp -p "$zshrc" "$zshrc.gbp-backup"; then
+      local tmp; tmp="$(mktemp "${TMPDIR:-/tmp}/gbp-zshrc.XXXXXX")"
+      grep -vxF "$GBP_PATH_LINE" "$zshrc" > "$tmp"
+      cat "$tmp" > "$zshrc" && echo "Removed the PATH line from $zshrc (backup: $zshrc.gbp-backup)"
+      rm -f "$tmp"
+    else
+      echo "Could not back up $zshrc; left it unchanged."
+    fi
+  fi
+  # 5. Profiles (only when asked).
+  if $delete_profiles; then
+    for s in $slugs; do rm -rf "$(profile_dir "$s")" && echo "Deleted profile $(profile_dir "$s")"; done
+    rmdir "$GBP_HOME" 2>/dev/null && echo "Removed $GBP_HOME"
+  elif [ -n "$slugs" ]; then
+    echo "Kept your profiles in $GBP_HOME (delete that folder yourself to remove their sign-ins)."
+  fi
+  echo "Your Grok Bot app and default Grok Bot data were not touched."
+  # 6. The repo itself, last.
+  if [ -n "$repo" ]; then
+    rm -rf "$repo" && echo "Deleted $repo"
+  fi
+  echo "GB Launcher is uninstalled."
+  exit 0
+}
+
 cmd_pick() {
   local slugs=() s i=2 answer
   echo "Grok Bot profiles:"
@@ -687,6 +863,7 @@ main() {
     quit|stop) cmd_quit "$@" ;;
     badge) cmd_badge "$@" ;;
     shortcut) cmd_shortcut "$@" ;;
+    uninstall) cmd_uninstall "$@" ;;
     *) cmd_launch "$cmd" ;;
   esac
 }

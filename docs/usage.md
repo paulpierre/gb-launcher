@@ -13,6 +13,7 @@
 | `gbp quit <profile> [--force]` | Quit only that profile's instance (`default` needs `--force`) |
 | `gbp badge <profile> [--debug] [--always]` | Restart the badge for a running profile |
 | `gbp shortcut ...` | Create or remove double-clickable launchers (see below) |
+| `gbp uninstall` | Remove gbp, its shortcuts and PATH line; asks before deleting profiles ([details](troubleshooting.md#uninstall)) |
 | `gbp help <command>` or `gbp <command> --help` | Help for any command |
 
 `<profile>` can be the folder name, the display name, or the number. `default` (or `1`) is your normal Grok Bot. It never gets a badge, and `gbp quit default` needs `--force`.

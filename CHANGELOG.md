@@ -3,6 +3,11 @@
 ## Unreleased
 
 ### Added
+* `gbp uninstall`: quits extra profiles, removes GB Launcher shortcuts (by bundle id), the `~/.local/bin/gbp` symlink, the installer's `~/.zshrc` PATH line (with backup) and the clone; asks separately before deleting profiles. Flags: `--yes`, `--delete-profiles`, `--keep-path`, `--keep-repo`.
+
+## 0.1.0 - 2026-11-03
+
+### Added
 * `gbp` profile launcher: picker, launch/activate, `list`, `new`, `edit`, `quit`, `badge`, `shortcut` (`--all`, `--remove`, `--dest`, `--applications`), per-command `--help`.
 * `grok-badge` helper: click-through colored, numbered badge (optional icon and border) pinned to the profile's window. Shown only while that instance is frontmost (`--always` to override), `--debug` placement logging, offscreen icon rendering for shortcuts.
 * Extra profiles get an explicit `SAND_DATA_ROOT` inside the profile folder.

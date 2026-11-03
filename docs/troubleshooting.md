@@ -28,7 +28,32 @@ After that first sign-in, both run side by side. `gbp` prints this reminder when
 
 ## Uninstall
 
-Quit each running profile first (`gbp list` shows them), then:
+```bash
+gbp uninstall
+```
+
+It lists what it will remove and asks `Continue? [y/N]`. Then it:
+
+* quits every running extra profile and its badge (never your default Grok Bot);
+* removes GB Launcher shortcuts in `~/Desktop`, `~/Applications` and `/Applications`, matched only by their bundle id (`io.gblauncher.profile.*`, or the older `io.gbghost.profile.*`), so no other app is touched;
+* removes `~/.local/bin/gbp`, only if it's a symlink into this GB Launcher folder;
+* removes the exact line `export PATH="$HOME/.local/bin:$PATH"` from `~/.zshrc`, after backing it up to `~/.zshrc.gbp-backup`. Other tools you keep in `~/.local/bin` may rely on that line; use `--keep-path` to leave it;
+* deletes the GB Launcher folder (the clone) last.
+
+It asks separately, `Also delete your profiles and their sign-ins in ~/GrokBotProfiles? [y/N]`. The default is no, so profiles are kept unless you say yes.
+
+| Flag | Effect |
+|---|---|
+| `--yes` | Don't ask. Profiles are still **kept** unless you also pass `--delete-profiles` |
+| `--delete-profiles` | Also delete every profile folder and its sign-ins |
+| `--keep-path` | Leave `~/.zshrc` unchanged |
+| `--keep-repo` | Leave the GB Launcher folder in place |
+
+It never touches the Grok Bot app or your default Grok Bot data.
+
+### Manual uninstall
+
+If `gbp` no longer works, quit each running profile first (`gbp list` shows them), then:
 
 ```bash
 gbp quit work

@@ -54,7 +54,16 @@ Any time after that, run `gbp` on its own to pick a profile from a menu.
 | `gbp edit <profile>` | Change name, number, color, icon or border |
 | `gbp quit <profile>` | Quit only that profile |
 | `gbp shortcut <profile>` | Double-clickable launcher app |
+| `gbp uninstall` | Remove GB Launcher (asks first) |
 | `gbp help <command>` | Help for any command |
+
+## Uninstall
+
+```bash
+gbp uninstall
+```
+
+Your profiles and their sign-ins are kept unless you answer yes when it asks. [Details and flags](docs/troubleshooting.md#uninstall).
 
 ## More
 
