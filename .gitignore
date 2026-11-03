@@ -1,0 +1,35 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+
+# Swift / Xcode
+.build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.xcscmblueprint
+Packages/
+.swiftpm/
+
+# Signing / secrets
+*.p12
+*.mobileprovision
+*.provisionprofile
+*.pem
+*.key
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# Logs and test coverage
+*.log
+coverage/
+
+# gb-launcher local
+launcher/bin/grok-badge
+LOCAL_NOTES.md

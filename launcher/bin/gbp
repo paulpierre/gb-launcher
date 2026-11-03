@@ -1,0 +1,694 @@
+#!/bin/bash
+# gbp - Grok Bot Profiles: run several Grok Bot desktop sessions side by side,
+# each with its own isolated data folder and a colored badge on its window.
+#
+# Unofficial community tool. Not affiliated with the makers of Grok Bot.
+# It relies on the undocumented SAND_USER_DATA_DIR environment variable that
+# the Grok Bot desktop app reads at startup; a future app update may break it.
+#
+# Run `gbp --help` for usage.
+
+set -uo pipefail
+
+# ---------------------------------------------------------------------------
+# Configuration (overridable through the environment)
+# ---------------------------------------------------------------------------
+GBP_HOME="${GBP_HOME:-$HOME/GrokBotProfiles}"          # where profiles live
+GBP_APP="${GBP_APP:-/Applications/Grok Bot.app}"        # the Grok Bot app bundle
+GBP_DEFAULT_DATA="${GBP_DEFAULT_DATA:-$HOME/Library/Application Support/Grok Bot}"
+GBP_LAUNCH_TIMEOUT="${GBP_LAUNCH_TIMEOUT:-30}"          # seconds to wait for a new instance
+
+PRESET_NAMES="purple blue green orange red pink teal yellow indigo cyan gray"
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
+die() { printf 'gbp: %s\n' "$*" >&2; exit 1; }
+info() { printf '%s\n' "$*"; }
+
+# Resolve the real directory of this script, following symlinks
+# (so `~/.local/bin/gbp -> repo/launcher/bin/gbp` still finds grok-badge).
+script_dir() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [ -L "$src" ]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+GBP_BIN_DIR="$(script_dir)"
+GBP_SELF="$GBP_BIN_DIR/gbp"
+BADGE_BIN="${GBP_BADGE_BIN:-$GBP_BIN_DIR/grok-badge}"
+BUNDLE_PREFIX="io.gblauncher.profile"        # shortcut .app bundle ids
+LEGACY_BUNDLE_PREFIXES="io.gbghost.profile"  # older names, still removable
+
+# Map a preset color name to hex; pass through valid #RRGGBB values.
+color_hex() {
+  local c
+  c="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$c" in
+    purple) echo "#8B5CF6" ;; blue) echo "#3B82F6" ;; green) echo "#22C55E" ;;
+    orange) echo "#F97316" ;; red) echo "#EF4444" ;; pink) echo "#EC4899" ;;
+    teal) echo "#14B8A6" ;; yellow) echo "#EAB308" ;; indigo) echo "#6366F1" ;;
+    cyan) echo "#06B6D4" ;; gray|grey) echo "#6B7280" ;;
+    \#[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) printf '%s\n' "$1" | tr '[:lower:]' '[:upper:]' ;;
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) printf '#%s\n' "$1" | tr '[:lower:]' '[:upper:]' ;;
+    *) return 1 ;;
+  esac
+}
+
+# Print a two-space ANSI truecolor swatch for a hex color.
+swatch() {
+  local h="${1#\#}"
+  if [ -t 1 ] && [ ${#h} -eq 6 ]; then
+    printf '\033[48;2;%d;%d;%dm  \033[0m' "0x${h:0:2}" "0x${h:2:2}" "0x${h:4:2}"
+  else
+    printf '  '
+  fi
+}
+
+# Escape a string for inclusion in JSON.
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"; s="${s//\"/\\\"}"
+  s="${s//$'\n'/ }"; s="${s//$'\t'/ }"
+  printf '%s' "$s"
+}
+
+# Read one string/number field from a profile.json (plutil understands JSON).
+json_get() {
+  plutil -extract "$2" raw -o - "$1" 2>/dev/null || true
+}
+
+# A profile id ("slug") is the folder name: lowercase letters, digits, dashes.
+valid_slug() { [[ "$1" =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]]; }
+slugify() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed -e 's/^-*//' -e 's/-*$//' | cut -c1-32
+}
+
+profile_dir() { printf '%s/%s' "$GBP_HOME" "$1"; }
+profile_json() { printf '%s/profile.json' "$(profile_dir "$1")"; }
+
+# Field accessors with sensible defaults.
+p_name()   { local v; v="$(json_get "$(profile_json "$1")" name)";   printf '%s' "${v:-$1}"; }
+p_number() { local v; v="$(json_get "$(profile_json "$1")" number)"; printf '%s' "${v:-?}"; }
+p_color()  { local v; v="$(json_get "$(profile_json "$1")" color)";  printf '%s' "${v:-#8B5CF6}"; }
+p_icon()   { local v; v="$(json_get "$(profile_json "$1")" icon)";   printf '%s' "$v"; }
+p_border() { local v; v="$(json_get "$(profile_json "$1")" border)"; printf '%s' "${v:-false}"; }
+p_always() { local v; v="$(json_get "$(profile_json "$1")" always)"; printf '%s' "${v:-false}"; }
+
+write_profile() { # slug name number color icon border [always]
+  local f extra=""; f="$(profile_json "$1")"
+  mkdir -p "$(profile_dir "$1")/cua"
+  # "always" (badge visible even when another app is frontmost) is optional.
+  [ "${7:-false}" = true ] && extra=$',\n  "always": true'
+  printf '{\n  "name": "%s",\n  "number": %s,\n  "color": "%s",\n  "icon": "%s",\n  "border": %s%s\n}\n' \
+    "$(json_escape "$2")" "$3" "$(json_escape "$4")" "$(json_escape "$5")" "$6" "$extra" > "$f.tmp" && mv "$f.tmp" "$f"
+}
+
+# List profile slugs (folders that contain a profile.json), sorted by number.
+list_slugs() {
+  local d s
+  [ -d "$GBP_HOME" ] || return 0
+  for d in "$GBP_HOME"/*/; do
+    [ -f "${d}profile.json" ] || continue
+    s="$(basename "$d")"
+    printf '%s\t%s\n' "$(p_number "$s")" "$s"
+  done | sort -n | cut -f2
+}
+
+next_number() {
+  local max=1 s n
+  for s in $(list_slugs); do
+    n="$(p_number "$s")"
+    [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -gt "$max" ] && max="$n"
+  done
+  echo $((max + 1))
+}
+
+# Resolve user input (slug, display name, or number) to a slug, or "default".
+resolve_profile() {
+  local want s lower
+  want="$1"; lower="$(printf '%s' "$want" | tr '[:upper:]' '[:lower:]')"
+  case "$lower" in default|1|main) echo default; return 0 ;; esac
+  for s in $(list_slugs); do
+    if [ "$s" = "$lower" ] || [ "$(p_number "$s")" = "$want" ] \
+       || [ "$(p_name "$s" | tr '[:upper:]' '[:lower:]')" = "$lower" ]; then
+      echo "$s"; return 0
+    fi
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# Process discovery
+# A Grok Bot main process is ".../Contents/MacOS/Grok Bot". We tell instances
+# apart by the --user-data-dir that its Chromium child processes carry.
+# ---------------------------------------------------------------------------
+
+main_pids() {
+  ps -axo pid=,command= | awk -v exe="$GBP_APP/Contents/MacOS/Grok Bot" '
+    { pid=$1; sub(/^ *[0-9]+ /, ""); if ($0 == exe) print pid }'
+}
+
+# Print the user-data-dir used by a main PID (from its child processes).
+data_dir_of() {
+  ps -axo ppid=,command= | awk -v p="$1" '
+    $1 == p && match($0, /--user-data-dir=/) {
+      rest = substr($0, RSTART + RLENGTH)
+      # the path can contain spaces; it ends at the next " --" flag
+      n = index(rest, " --"); if (n > 0) rest = substr(rest, 1, n - 1)
+      print rest; exit }'
+}
+
+# Print the main PID running a given profile slug (or "default"), if any.
+pid_of_profile() {
+  local want pid dir
+  if [ "$1" = default ]; then want="$GBP_DEFAULT_DATA"; else want="$(profile_dir "$1")"; fi
+  for pid in $(main_pids); do
+    dir="$(data_dir_of "$pid")"
+    [ "$dir" = "$want" ] && { echo "$pid"; return 0; }
+  done
+  return 1
+}
+
+badge_pid_file() { printf '%s/badge.pid' "$(profile_dir "$1")"; }
+
+badge_running() { # slug -> prints badge helper pid if alive
+  local f pid
+  f="$(badge_pid_file "$1")"
+  [ -f "$f" ] || return 1
+  pid="$(cat "$f" 2>/dev/null)"
+  [ -n "$pid" ] && ps -p "$pid" -o command= 2>/dev/null | grep -q 'grok-badge' && { echo "$pid"; return 0; }
+  return 1
+}
+
+ensure_badge_bin() {
+  [ -x "$BADGE_BIN" ] && return 0
+  info "grok-badge helper is not built yet; building it now..."
+  "$GBP_BIN_DIR/../scripts/build.sh" || die "could not build grok-badge (needs Xcode command line tools)"
+}
+
+# Start the badge helper for a profile's running instance (no-op for default).
+start_badge() { # slug pid
+  local slug="$1" pid="$2" args bpid icon
+  [ "$slug" = default ] && return 0
+  if bpid="$(badge_running "$slug")"; then
+    # Already tracking this exact instance? Then nothing to do.
+    ps -p "$bpid" -o command= | grep -q -- "--pid $pid " && return 0
+    kill "$bpid" 2>/dev/null
+  fi
+  ensure_badge_bin || return 1
+  args=(--pid "$pid" --label "$(p_name "$slug")" --number "$(p_number "$slug")" --color "$(p_color "$slug")"
+        --log "$(profile_dir "$slug")/badge.log")
+  icon="$(p_icon "$slug")"
+  [ -n "$icon" ] && [ -f "$icon" ] && args+=(--icon "$icon")
+  [ "$(p_border "$slug")" = true ] && args+=(--border)
+  { [ "$(p_always "$slug")" = true ] || [ "${GBP_BADGE_ALWAYS:-0}" = 1 ]; } && args+=(--always)
+  [ "${GBP_BADGE_DEBUG:-0}" = 1 ] && args+=(--debug)
+  nohup "$BADGE_BIN" "${args[@]}" >/dev/null 2>&1 &
+  echo $! > "$(badge_pid_file "$slug")"
+}
+
+activate_pid() { ensure_badge_bin && "$BADGE_BIN" --pid "$1" --activate; }
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+usage() {
+  cat <<'EOF'
+gbp (GB Launcher) - run several Grok Bot profiles side by side (unofficial)
+
+Usage:
+  gbp                      pick a profile interactively and launch it
+  gbp <profile>            launch a profile (or bring it to front if running)
+  gbp list                 show profiles, colors, icons and running PIDs
+  gbp new [name]           create a profile now: next number, next free color,
+                           no questions (name defaults to "Profile N")
+  gbp new -i [name]        same, but ask for each setting (Enter accepts defaults)
+  gbp edit <profile>       change name, number, color, icon, border, badge visibility
+  gbp quit <profile>       quit only that profile's Grok Bot instance
+  gbp badge <profile>      (re)start the window badge for a running profile
+  gbp shortcut <profile>   create a double-clickable launcher .app (see --help)
+  gbp help [command]       show help for a command
+
+<profile> can be the folder name, the display name, or the number.
+"default" (or 1) is your normal Grok Bot data and never gets a badge.
+
+Profiles live in ~/GrokBotProfiles/<name>/ (override with GBP_HOME).
+Never use `pkill "Grok Bot"` or AppleScript `quit` - they hit every instance.
+EOF
+}
+
+help_for() {
+  case "${1:-}" in
+    list) echo "gbp list - show every profile: number, color swatch, name, icon, and running PID (or 'stopped')." ;;
+    new) cat <<'EOF'
+gbp new [name]
+gbp new -i|--interactive [name]
+
+Creates a profile right away with smart defaults and no questions:
+  name    "Profile N" (or the name you give)
+  number  the next free number (Default is 1, so your first new one is 2)
+  color   the next preset color no profile uses yet: purple, blue, green, ...
+  folder  made from the name (work, work-2, ... if taken)
+-i asks for name, number, color (preset or #RRGGBB), an optional icon image
+(png/jpg/icns, copied as icon.png) and a border; Enter accepts each default.
+Change anything later with: gbp edit <profile>
+EOF
+    ;;
+    edit) echo "gbp edit <profile> - change name, number, color, icon, border, and whether the badge shows while other apps are in front. Press Enter to keep a value; type 'none' to clear the icon." ;;
+    quit) echo "gbp quit <profile> [--force] - send a normal quit (SIGTERM) to that profile's main process only. Quitting 'default' requires --force." ;;
+    badge) cat <<'EOF'
+gbp badge <profile> [--debug] [--always]
+Restart the badge helper for a running profile (after editing colors, for example).
+The badge shows only while that instance is the frontmost app and its window is
+on screen. --always keeps it visible while other apps are in front (or set
+"always": true in profile.json). --debug logs placement details to
+~/GrokBotProfiles/<profile>/badge.log. GBP_BADGE_DEBUG=1 / GBP_BADGE_ALWAYS=1
+do the same for every launch.
+EOF
+    ;;
+    shortcut) cat <<'EOF'
+gbp shortcut <profile> [--dest <dir>] [--applications]
+gbp shortcut --all [--dest <dir>] [--applications]
+gbp shortcut --remove <profile> [--dest <dir>] [--applications]
+
+Creates "Grok Bot - <name>.app", a tiny double-clickable bundle that runs
+`gbp <profile>`, with the profile's icon (or a colored tile with its number).
+Default destination is ~/Desktop; --applications uses ~/Applications
+(drag it to the Dock from there); --dest picks any folder.
+--remove deletes that profile's shortcut(s) in the folder, matched by bundle id
+(io.gblauncher.profile.<name>, or the older io.gbghost.profile.<name>).
+EOF
+    ;;
+    *) usage ;;
+  esac
+}
+
+cmd_list() {
+  local s pid icon status
+  printf '%-4s %-2s %-20s %-10s %-5s %s\n' "#" "" "NAME" "ID" "ICON" "STATUS"
+  if pid="$(pid_of_profile default)"; then status="running (pid $pid)"; else status="stopped"; fi
+  printf '%-4s %-2s %-20s %-10s %-5s %s\n' "1" "  " "Default" "default" "-" "$status"
+  for s in $(list_slugs); do
+    icon="-"; [ -n "$(p_icon "$s")" ] && [ -f "$(p_icon "$s")" ] && icon="yes"
+    if pid="$(pid_of_profile "$s")"; then
+      status="running (pid $pid)"
+      badge_running "$s" >/dev/null && status="$status, badge on"
+    else
+      status="stopped"
+    fi
+    printf '%-4s ' "$(p_number "$s")"; swatch "$(p_color "$s")"
+    printf ' %-20s %-10s %-5s %s\n' "$(p_name "$s")" "$s" "$icon" "$status"
+  done
+}
+
+# Interactive color menu; prints a hex color.
+choose_color() {
+  local current="${1:-}" i=1 n c answer
+  {
+    echo "Colors:"
+    for n in $PRESET_NAMES; do
+      printf '  %2d) ' "$i"; swatch "$(color_hex "$n")"; printf ' %s\n' "$n"
+      i=$((i + 1))
+    done
+    echo "  or type a hex color like #FF8800"
+  } >&2
+  while true; do
+    if [ -n "$current" ]; then printf 'Color [%s]: ' "$current" >&2; else printf 'Color [purple]: ' >&2; fi
+    read -r answer || exit 1
+    [ -z "$answer" ] && answer="${current:-purple}"
+    if [[ "$answer" =~ ^[0-9]+$ ]]; then
+      i=1
+      for n in $PRESET_NAMES; do [ "$i" = "$answer" ] && answer="$n"; i=$((i + 1)); done
+    fi
+    if c="$(color_hex "$answer")"; then echo "$c"; return 0; fi
+    echo "Not a preset or #RRGGBB color, try again." >&2
+  done
+}
+
+# Copy an icon image into the profile folder as icon.png; prints the new path.
+import_icon() { # slug source-path
+  local src="${2/#\~/$HOME}" dest
+  [ -f "$src" ] || { echo "No such file: $src" >&2; return 1; }
+  dest="$(profile_dir "$1")/icon.png"
+  sips -s format png -Z 256 "$src" --out "$dest" >/dev/null 2>&1 || { echo "Could not convert $src" >&2; return 1; }
+  echo "$dest"
+}
+
+# Hex color -> preset name (or the hex itself when it isn't a preset).
+color_name() {
+  local n
+  for n in $PRESET_NAMES; do
+    [ "$(color_hex "$n")" = "$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')" ] && { echo "$n"; return 0; }
+  done
+  printf '%s\n' "$1"
+}
+
+# Smart default color for a new profile: the first preset (in PRESET_NAMES
+# order, skipping gray, which Default uses) that no profile uses yet. When all
+# are taken, cycle through them by profile number. Prints a preset name.
+next_color() { # number
+  local used=" " s n count=0 pick=""
+  for s in $(list_slugs); do used="$used$(p_color "$s" | tr '[:lower:]' '[:upper:]') "; done
+  for n in $PRESET_NAMES; do
+    [ "$n" = gray ] && continue
+    count=$((count + 1))
+    case "$used" in *" $(color_hex "$n") "*) continue ;; esac
+    echo "$n"; return 0
+  done
+  pick=$(( (${1:-2} - 2) % count ))
+  [ "$pick" -lt 0 ] && pick=0
+  count=0
+  for n in $PRESET_NAMES; do
+    [ "$n" = gray ] && continue
+    [ "$count" -eq "$pick" ] && { echo "$n"; return 0; }
+    count=$((count + 1))
+  done
+}
+
+# A folder name for a display name that isn't taken yet (work, work-2, ...).
+unique_slug() { # name number
+  local base slug i=2
+  base="$(slugify "$1" | cut -c1-28 | sed 's/-*$//')"
+  valid_slug "$base" || base="profile-$2"
+  [ "$base" = default ] && base="default-profile"
+  slug="$base"
+  while [ -e "$(profile_dir "$slug")" ]; do slug="$base-$i"; i=$((i + 1)); done
+  printf '%s' "$slug"
+}
+
+# Create the profile folder + profile.json and print a short summary.
+# Sets NEW_SLUG for callers (the picker offers to launch it).
+NEW_SLUG=""
+create_profile() { # slug name number color-hex icon-src border
+  local slug="$1" icon=""
+  mkdir -p "$(profile_dir "$slug")/cua" || die "cannot create $(profile_dir "$slug")"
+  if [ -n "${5:-}" ]; then icon="$(import_icon "$slug" "$5")" || icon=""; fi
+  write_profile "$slug" "$2" "$3" "$4" "$icon" "${6:-false}"
+  NEW_SLUG="$slug"
+  printf 'Created '; swatch "$4"; printf ' %s  (#%s, %s, folder %s)\n' "$2" "$3" "$(color_name "$4")" "$slug"
+  info "  Launch it:      gbp $slug   (or: gbp $3)"
+  info "  Change it:      gbp edit $slug"
+}
+
+cmd_new() {
+  local interactive=false name="" a slug number color src border=false answer
+  for a in "$@"; do
+    case "$a" in
+      -i|--interactive) interactive=true ;;
+      -h|--help) help_for new; return 0 ;;
+      -*) die "unknown option for new: $a (see: gbp help new)" ;;
+      *) name="${name:+$name }$a" ;;
+    esac
+  done
+  number="$(next_number)"
+  if ! $interactive; then
+    # Zero questions: everything gets a smart default.
+    [ -n "$name" ] || name="Profile $number"
+    slug="$(unique_slug "$name" "$number")"
+    create_profile "$slug" "$name" "$number" "$(color_hex "$(next_color "$number")")" "" false
+    return 0
+  fi
+  # Interactive: every prompt is pre-filled with the smart default (Enter accepts).
+  printf 'Profile name [%s]: ' "${name:-Profile $number}"; read -r answer || exit 1
+  name="${answer:-${name:-Profile $number}}"
+  printf 'Number [%s]: ' "$number"; read -r answer || exit 1
+  number="${answer:-$number}"
+  [[ "$number" =~ ^[0-9]+$ ]] || die "number must be a whole number"
+  slug="$(unique_slug "$name" "$number")"
+  color="$(choose_color "$(next_color "$number")")"
+  printf 'Icon image path (png/jpg/icns, Enter to skip): '; read -r src || exit 1
+  printf 'Colored border around the window? [y/N]: '; read -r answer || exit 1
+  case "$answer" in y|Y|yes) border=true ;; esac
+  create_profile "$slug" "$name" "$number" "$color" "$src" "$border"
+}
+
+cmd_edit() {
+  local slug name number color icon border always answer src
+  [ -n "${1:-}" ] || die "usage: gbp edit <profile>"
+  slug="$(resolve_profile "$1")" || die "no such profile: $1"
+  [ "$slug" = default ] && die "the default profile has no settings to edit"
+  name="$(p_name "$slug")"; number="$(p_number "$slug")"; color="$(p_color "$slug")"
+  icon="$(p_icon "$slug")"; border="$(p_border "$slug")"; always="$(p_always "$slug")"
+  printf 'Name [%s]: ' "$name"; read -r answer || exit 1; name="${answer:-$name}"
+  printf 'Number [%s]: ' "$number"; read -r answer || exit 1; number="${answer:-$number}"
+  [[ "$number" =~ ^[0-9]+$ ]] || die "number must be a whole number"
+  color="$(choose_color "$color")"
+  printf 'Icon image path [%s] (Enter keeps, "none" clears): ' "${icon:-none}"; read -r src || exit 1
+  case "$src" in
+    "") ;;
+    none) icon=""; rm -f "$(profile_dir "$slug")/icon.png" ;;
+    *) icon="$(import_icon "$slug" "$src")" || icon="$(p_icon "$slug")" ;;
+  esac
+  printf 'Colored border [%s] (y/n, Enter keeps): ' "$border"; read -r answer || exit 1
+  case "$answer" in y|Y|yes) border=true ;; n|N|no) border=false ;; esac
+  printf 'Show badge even when another app is in front [%s] (y/n, Enter keeps): ' "$always"; read -r answer || exit 1
+  case "$answer" in y|Y|yes) always=true ;; n|N|no) always=false ;; esac
+  write_profile "$slug" "$name" "$number" "$color" "$icon" "$border" "$always"
+  info "Saved $(profile_json "$slug")"
+  local pid
+  if pid="$(pid_of_profile "$slug")"; then
+    kill "$(badge_running "$slug")" 2>/dev/null
+    start_badge "$slug" "$pid" && info "Badge restarted for pid $pid"
+  fi
+}
+
+# grokbot:// sign-in callbacks are routed by macOS to ONE running Grok Bot
+# (normally your default instance), not to the profile that started the login.
+# Warn before the first launch of a never-signed-in profile while default runs.
+signin_warning() { # slug
+  [ -f "$(profile_dir "$1")/Cookies" ] && return 0
+  pid_of_profile default >/dev/null || return 0
+  cat >&2 <<'EOF'
+gbp: heads-up - this profile has never been signed in and your default Grok Bot
+     is running. macOS delivers the browser's sign-in callback to the default
+     instance, which can knock your default instance's computer connection
+     offline until you restart it. Safest one-time sign-in:
+       1. quit your default Grok Bot,  2. run this profile and sign in,
+       3. reopen the default Grok Bot (open -a "Grok Bot").
+     After that first sign-in both run side by side.
+EOF
+}
+
+cmd_launch() {
+  local slug pid before after p found=""
+  slug="$(resolve_profile "$1")" || die "no such profile: $1 (see: gbp list)"
+  [ -d "$GBP_APP" ] || die "Grok Bot not found at $GBP_APP (set GBP_APP)"
+  if pid="$(pid_of_profile "$slug")"; then
+    info "Profile '$slug' is already running (pid $pid); bringing it to front."
+    start_badge "$slug" "$pid"
+    activate_pid "$pid" || info "(could not activate it; switch to it with Cmd+Tab)"
+    return 0
+  fi
+  before=" $(main_pids | tr '\n' ' ') "
+  if [ "$slug" = default ]; then
+    open -n -a "$GBP_APP"
+  else
+    mkdir -p "$(profile_dir "$slug")/cua"
+    signin_warning "$slug"
+    # SAND_DATA_ROOT is set explicitly (it would default to the same place) so
+    # this instance's local-exec daemon, credentials and logs can never fall
+    # back to the shared ~/.grokbot used by your default Grok Bot.
+    open -n -a "$GBP_APP" \
+      --env "SAND_USER_DATA_DIR=$(profile_dir "$slug")" \
+      --env "SAND_DATA_ROOT=$(profile_dir "$slug")/sand-data" \
+      --env "CUA_APP_SUPPORT_DIR=$(profile_dir "$slug")/cua" \
+      --stdout "$(profile_dir "$slug")/launch.log" --stderr "$(profile_dir "$slug")/launch.log"
+  fi
+  # Wait for the new main process whose children use this profile's folder.
+  local i=0
+  while [ $i -lt $((GBP_LAUNCH_TIMEOUT * 2)) ]; do
+    after="$(main_pids)"
+    for p in $after; do
+      case "$before" in *" $p "*) continue ;; esac
+      if pid="$(pid_of_profile "$slug")" && [ "$pid" = "$p" ]; then found="$p"; break; fi
+    done
+    [ -n "$found" ] && break
+    sleep 0.5; i=$((i + 1))
+  done
+  [ -n "$found" ] || die "Grok Bot started but no instance for '$slug' appeared within ${GBP_LAUNCH_TIMEOUT}s"
+  info "Launched '$(p_name "$slug" 2>/dev/null || echo "$slug")' (pid $found)."
+  [ "$slug" = default ] || info "Note: only your default profile should be your registered computer (local tools). If it shows offline, restart the default Grok Bot."
+  start_badge "$slug" "$found"
+}
+
+cmd_quit() {
+  local slug pid force="${2:-}"
+  [ -n "${1:-}" ] || die "usage: gbp quit <profile> [--force]"
+  slug="$(resolve_profile "$1")" || die "no such profile: $1"
+  if [ "$slug" = default ] && [ "$force" != "--force" ]; then
+    die "refusing to quit your default Grok Bot without --force"
+  fi
+  pid="$(pid_of_profile "$slug")" || { info "Profile '$slug' is not running."; return 0; }
+  info "Quitting '$slug' (pid $pid)..."
+  kill -TERM "$pid" || die "could not signal pid $pid"
+  # The badge helper notices the process is gone and exits by itself.
+}
+
+cmd_badge() {
+  local slug pid a
+  for a in "${@:2}"; do
+    case "$a" in
+      --debug) export GBP_BADGE_DEBUG=1 ;;
+      --always) export GBP_BADGE_ALWAYS=1 ;;
+      *) die "unknown option for badge: $a" ;;
+    esac
+  done
+  slug="$(resolve_profile "${1:-}")" || die "no such profile: ${1:-}"
+  pid="$(pid_of_profile "$slug")" || die "profile '$slug' is not running"
+  [ "$slug" = default ] && { info "The default profile has no badge."; return 0; }
+  kill "$(badge_running "$slug")" 2>/dev/null
+  start_badge "$slug" "$pid" && info "Badge started for '$slug' (pid $pid)."
+}
+
+# Build "<dest>/Grok Bot - <name>.app" that runs `gbp <slug>`.
+make_shortcut() { # slug dest
+  local slug="$1" dest="$2" name app tmp png
+  if [ "$slug" = default ]; then name="Default"; else name="$(p_name "$slug")"; fi
+  app="$dest/Grok Bot - $name.app"
+  ensure_badge_bin || return 1
+  mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+  cat > "$app/Contents/MacOS/launch" <<EOF
+#!/bin/bash
+# Generated by gbp. Launches the "$name" Grok Bot profile.
+exec "$GBP_SELF" "$slug"
+EOF
+  chmod +x "$app/Contents/MacOS/launch"
+  cat > "$app/Contents/Info.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key><string>$BUNDLE_PREFIX.$slug</string>
+  <key>CFBundleName</key><string>Grok Bot - $(json_escape "$name")</string>
+  <key>CFBundleExecutable</key><string>launch</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>LSUIElement</key><true/>
+</dict>
+</plist>
+EOF
+  # Icon: profile image, or a colored tile with the profile number.
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/gbp-icon.XXXXXX")"
+  png="$tmp/icon.png"
+  if [ "$slug" = default ]; then
+    "$BADGE_BIN" --render-icon "$png" --number 1 --color gray
+  elif [ -n "$(p_icon "$slug")" ] && [ -f "$(p_icon "$slug")" ]; then
+    "$BADGE_BIN" --render-icon "$png" --icon "$(p_icon "$slug")"
+  else
+    "$BADGE_BIN" --render-icon "$png" --number "$(p_number "$slug")" --color "$(p_color "$slug")"
+  fi
+  mkdir -p "$tmp/AppIcon.iconset"
+  local s
+  for s in 16 32 128 256 512; do
+    sips -z "$s" "$s" "$png" --out "$tmp/AppIcon.iconset/icon_${s}x${s}.png" >/dev/null
+    sips -z $((s * 2)) $((s * 2)) "$png" --out "$tmp/AppIcon.iconset/icon_${s}x${s}@2x.png" >/dev/null
+  done
+  iconutil -c icns "$tmp/AppIcon.iconset" -o "$app/Contents/Resources/AppIcon.icns"
+  rm -rf "$tmp"
+  touch "$app"   # nudge Finder to refresh the icon
+  info "Created $app"
+}
+
+# Remove this profile's shortcut(s) in a folder: any .app whose bundle id is
+# <prefix>.<slug> for the current or a legacy prefix (so renamed profiles and
+# old io.gbghost.* shortcuts are found too). Never touches other apps.
+remove_shortcuts() { # slug dest
+  local slug="$1" dest="$2" app id p found=false
+  for app in "$dest"/*.app; do
+    [ -f "$app/Contents/Info.plist" ] || continue
+    id="$(plutil -extract CFBundleIdentifier raw -o - "$app/Contents/Info.plist" 2>/dev/null)" || continue
+    for p in $BUNDLE_PREFIX $LEGACY_BUNDLE_PREFIXES; do
+      if [ "$id" = "$p.$slug" ]; then
+        rm -rf "$app" && info "Removed $app ($id)"; found=true
+      fi
+    done
+  done
+  $found || info "No shortcut for '$slug' in $dest"
+}
+
+cmd_shortcut() {
+  local dest="$HOME/Desktop" all=false remove=false target="" slug
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dest) [ $# -ge 2 ] || die "--dest needs a folder"; dest="$2"; shift ;;
+      --applications) dest="$HOME/Applications" ;;
+      --all) all=true ;;
+      --remove) remove=true ;;
+      -h|--help) help_for shortcut; return 0 ;;
+      *) target="$1" ;;
+    esac
+    shift
+  done
+  mkdir -p "$dest" || die "cannot create $dest"
+  if $remove; then
+    [ -n "$target" ] || die "usage: gbp shortcut --remove <profile>"
+    slug="$(resolve_profile "$target")" || die "no such profile: $target"
+    remove_shortcuts "$slug" "$dest"
+    return 0
+  fi
+  if $all; then
+    make_shortcut default "$dest"
+    for slug in $(list_slugs); do make_shortcut "$slug" "$dest"; done
+    return 0
+  fi
+  [ -n "$target" ] || die "usage: gbp shortcut <profile> [--dest <dir>] [--applications]"
+  slug="$(resolve_profile "$target")" || die "no such profile: $target"
+  make_shortcut "$slug" "$dest"
+}
+
+cmd_pick() {
+  local slugs=() s i=2 answer
+  echo "Grok Bot profiles:"
+  printf '   1) '; swatch "#6B7280"; printf ' Default\n'
+  for s in $(list_slugs); do
+    slugs+=("$s")
+    printf '  %2d) ' "$i"; swatch "$(p_color "$s")"; printf ' %s (#%s)\n' "$(p_name "$s")" "$(p_number "$s")"
+    i=$((i + 1))
+  done
+  echo "   n) new profile    q) cancel"
+  printf 'Choose: '; read -r answer || exit 1
+  case "$answer" in
+    q|Q|"") return 0 ;;
+    n|N)
+      cmd_new || return $?
+      printf 'Launch it now? [Y/n]: '; read -r answer || return 0
+      case "$answer" in n|N|no|No|NO) return 0 ;; esac
+      cmd_launch "$NEW_SLUG"
+      ;;
+    1) cmd_launch default ;;
+    *)
+      [[ "$answer" =~ ^[0-9]+$ ]] && [ "$answer" -ge 2 ] && [ "$answer" -lt "$i" ] || die "invalid choice: $answer"
+      cmd_launch "${slugs[$((answer - 2))]}"
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+main() {
+  local cmd="${1:-}"
+  [ $# -gt 0 ] && shift
+  # Per-command --help.
+  if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then help_for "$cmd"; return 0; fi
+  case "$cmd" in
+    "") cmd_pick ;;
+    -h|--help|help) if [ $# -gt 0 ]; then help_for "$1"; else usage; fi ;;
+    list|ls) cmd_list ;;
+    new|create) cmd_new "$@" ;;
+    edit) cmd_edit "$@" ;;
+    quit|stop) cmd_quit "$@" ;;
+    badge) cmd_badge "$@" ;;
+    shortcut) cmd_shortcut "$@" ;;
+    *) cmd_launch "$cmd" ;;
+  esac
+}
+
+main "$@"
