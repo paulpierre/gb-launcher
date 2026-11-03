@@ -1,6 +1,6 @@
 <p align="center"><img src="assets/gb-launcher-banner.png" alt="GB Launcher" width="720"></p>
 
-# GB Launcher: run multiple Grok Bot accounts at the same time on one Mac
+# Run multiple Grok Bot accounts at the same time on one Mac
 
 **GB Launcher** (`gbp`) lets you run multiple Grok Bot instances side by side on one Mac, each signed in to a different account. Open a second Grok Bot window for work, a third for personal, and tell them apart by a colored, numbered badge. Multi-account Grok Bot without a second computer, and Grok Bot itself is never modified.
 
